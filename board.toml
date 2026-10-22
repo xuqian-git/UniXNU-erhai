@@ -177,34 +177,17 @@ kernel_args = [
 
 [payload.adt]
 tool = "scripts/make-erhai-adt.py"
-# MEASURED, not copied. sheng uses 0x130000000 (4.75 GiB) because its board has
-# a contiguous low-RAM run; erhai does not. tools/window_from_memmap.py reads the
-# firmware's own memory map (MemoryMapLib.c, 72 descriptors) and shows:
-#
-#   Conv descriptors: 87.4 / 362.8 / 47.0 / 400.9 / 5.0 MiB
-#   largest single Reserved descriptor: 256.0 MiB (the Kernel window)
-#
-# DarwinBoot.c:451 tries Reserved first, then merged Conv runs (:476), and needs
-# ONE run >= WindowSize; it does AllocatePages(AllocateAddress), so a too-large
-# request is fatal and prints
-#   NO WINDOW <requested> BIG RUN <biggest> @ <start>
-# on the panel. 4.75 GiB would never allocate here.
-#
-# 0x10000000 = 256 MiB, exactly the "Kernel" reservation at 0xa8000000
-# (MemoryMapLib.c:86), which Pass 1 claims in place. The request must equal the
-# reservation: a 400 MiB request (the biggest Conv run) can never be satisfied
-# in Reserved memory and drove every boot into EFI_OUT_OF_RESOURCES.
-#
-# Two things had to line up for 256 MiB to actually fit:
-#   - Slide bias. Candidate was ALIGN(start, 2 MiB) + (Kernel.Base & 0x1FFFFF),
-#     i.e. 0xa8004000, which leaves 0x0FFFC000 of a 0x10000000 span — 16 KiB
-#     short, always. FitWindow() now retries at the unbiased 2 MiB-aligned
-#     start; that is sound because Boot() copies each segment to
-#     Address + (segment.Address - Kernel.Base), so the low-bit match is
-#     cosmetic and any 16 KiB aligned Address works.
-#   - Real free space. The window is taken from the reservation, not from the
-#     conventional heap that also holds UEFI's runtime data.
-owned_memory_size = "0x10000000"
+# 4 GiB, the RAM of the iPad7,1 this kernelcache is qualified for (sheng uses
+# 4.75 GiB). DarwinBoot's AllocateWindow takes ONE EfiConventionalMemory run of
+# at least this size and prints "NO WINDOW <requested> BIG RUN <biggest> @ <start>"
+# on the panel when none exists. Below 4 GiB erhai has nothing bigger than
+# ~400 MiB, so erhaiPkg's MemoryMapLib gives UEFI "DRAM_High", 0x8C0000000 +
+# 5 GiB of the 9 GiB run the ABL's /memory node lists on this unit (no fixed
+# reserved-memory node above 4 GiB). The window lands there; the remaining
+# ~1 GiB covers UEFI's own top-down allocations in that bank.
+# The first boots used 0x10000000 (256 MiB): enough to reach the root-device
+# wait, far too little for userspace.
+owned_memory_size = "0x100000000"
 # The real SM8750 MPIDRs, read off this unit and identical to sheng's SM8550
 # layout: six cores in cluster 0, two in cluster 1 at 0x10000/0x10100.
 #
