@@ -39,6 +39,22 @@ chip_id = 0x8011
 board_id = 12
 fetch = ["KernelCache", "DeviceTree", "StaticTrustCache", "Cryptex1,SystemTrustCache"]
 
+[ipsw.sha256]
+"044-76040-038.dmg" = "3f99b859c9728379110b66657c7b15285bcb1925ad8b5726542e2cdcf8b1028d"
+"044-76034-038.dmg" = "b4908cde41d23e6bc05e6af51a2c9eeb00cf0f863a6a18b1600c96a3fd70414f"
+
+# The raw image for the userdata partition: the OS and SystemOS disk images of the IPSW behind a manifest.
+# first_lba and last_lba are the GPT entry "userdata" of LUN 0 (sda15), read by NativeUfs on this unit
+# (2026-10-23, probe 10) and matching the 237,866,397,696-byte partition of the backup.
+[userdata]
+first_lba = 0x3798e8
+last_lba = 0x3adb7fa
+lba_bytes = 4096
+windows = [
+  { name = "OS", component = "OS" },
+  { name = "SystemOS", component = "Cryptex1,SystemOS" },
+]
+
 [kernel]
 defconfig = "erhai_defconfig"
 # The prelink (below) is what makes the payload kernel carry Apple's own kexts,
@@ -55,38 +71,38 @@ archives = [
   "build-arm-platform.py",
   "build-boot-progress.py",
   "build-libpthread-kernel.py",
-  # NativeUfs (erhai copy, drivers/NativeUfs) for the read-only probe boots:
-  # no verified-root policy yet, so it can inspect and read but never publish
-  # a root. Swap for the verified build once the root image exists.
-  "build-arm-driver.py NativeUfs --probe-only",
+  # UFS root, after sheng's list. NativeUfs is the erhai copy (drivers/NativeUfs);
+  # NativeVirtioBlock and its bindings provide the original IOBlockStorageDevice
+  # base its block device derives from. The verified bundles named by the
+  # defconfig are built outside this list (they need the owner key).
+  "build-arm-driver.py NativeAES",
+  "build-native-aes-bindings.py",
+  "build-arm-driver.py NativeUfs",
+  "build-arm-driver.py NativeVirtioBlock",
+  "build-native-virtio-bindings.py --component NativeVirtioBlock",
+  # Vendored from UniXNU-sheng (drivers/ShengPlatformPower here).
+  "build-sheng-platform-power.py",
 ]
 
 # The prelink is what makes the payload kernel carry Apple's own kexts.
 #
-# sheng (SM8550) shipped a larger root set that included AMFI and PMGR. That set
-# is WRONG on SM8750: AppleMobileFileIntegrity asks the policy manager for every
-# decision and panics with "AMFI: No PMGR" (ConfigurationSettings.cpp:235) when
-# no PMGR has published its nub, and nothing on this board publishes one.
-# 7Night-kqx/UniXNU-dada (Xiaomi 15, same SM8750) documents this and ships the
-# reduced set below; IssacL04/UniXNU-Pagani_SM8750 (OnePlus 13T, same SM8750)
-# drops the whole prelink for first boot. Follow dada.
-#
-# The four kexts that would drag AMFI back in through OSBundleLibraries:
-#   com.apple.iokit.IOGPUFamily            (GPU)
-#   com.apple.iokit.IOMobileGraphicsFamily (display accelerator)
-#   com.apple.iokit.IOHIDFamily            (input stack, + IOHIDEventDriver)
-#   com.apple.security.sandbox             (sandbox)
-# None is needed for the video console: that is XNU's own pexpert console,
-# drawn straight into the framebuffer DarwinBoot fills from the UEFI GOP.
+# AppleMobileFileIntegrity asks the policy manager for every decision and panics
+# with "AMFI: No PMGR" (ConfigurationSettings.cpp:235) when no PMGR has published
+# its nub. The early bring-up therefore left AMFI and PMGR out (as dada, Xiaomi 15
+# SM8750, does). Userspace needs AMFI, so the UFS-root build follows sheng:
+# ShengPlatformPower (sheng-pmgr=2) publishes the original ApplePMGR nub, and
+# AMFI, PMGR and sandbox are back in the set with AMFI's early security init.
+# Still left out (GPU / display / input, not needed to reach launchd):
+#   com.apple.iokit.IOGPUFamily, com.apple.iokit.IOMobileGraphicsFamily,
+#   com.apple.iokit.IOHIDFamily, com.apple.iokit.IOHIDEventDriver
 [kernel.prelink]
 tool = "kits/NativePrelink/emit_prelink.py"
 kernel = "build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837.unstripped.noctf"
 kernelcache_sha256 = "f18b4df865405f2a287b84977d7aca745e056d656d9fc9df1662970ce2969de7"
 slide = "-0x1000000"
-# No early_security_init on this board. That entry runs the original
-# AppleMobileFileIntegrity initializer; XNU only calls an early security
-# initializer when the prelink metadata names one, so dropping it keeps the
-# AMFI path off entirely. dada does the same for the same reason.
+# The original AppleMobileFileIntegrity initializer, run before MAC lockdown. The
+# address is in the original kernelcache pinned above, so sheng's value holds.
+early_security_init = "com.apple.driver.AppleMobileFileIntegrity=0xfffffff005ab4ae0"
 roots = [
   "com.apple.AppleFSCompression.AppleFSCompressionTypeZlib",
   "com.apple.driver.AppleARMPlatform",
@@ -95,7 +111,8 @@ roots = [
   "com.apple.driver.AppleEffaceableStorage",
   "com.apple.driver.AppleIISController",
   "com.apple.driver.AppleM2ScalerCSCDriver",
-  # AMFI and its policy manager are deliberately absent; see the note above.
+  "com.apple.driver.AppleMobileFileIntegrity",
+  "com.apple.driver.ApplePMGR",
   "com.apple.driver.IODARTFamily",
   "com.apple.filesystems.apfs",
   "com.apple.iokit.CoreAnalyticsFamily",
@@ -113,6 +130,7 @@ roots = [
   "com.apple.kext.AppleMatch",
   "com.apple.kext.CoreTrust",
   "com.apple.security.AppleImage4",
+  "com.apple.security.sandbox",
 ]
 
 [payload]
@@ -129,6 +147,11 @@ title = "OnePlus Pad 2 Pro: iPad7,1 bring-up"
 # Android-visible total, not the window DarwinBoot hands over, and passing a
 # figure the kernelcache never saw only invites a disagreeing memory map.
 dram_size = "0x80000000"
+# The original static + System trust caches, bundled unchanged by build-original-system-trust.py; the payload step only
+# accepts a --trust-cache with this hash (same as sheng: same IPSW).
+trust_cache_sha256 = [
+  "7416ca4f8377146626bb284e2133c76bee6cb4e3ee0af5d648b186235a7323a7",
+]
 timeout = 10
 # Patch the panic path so a panic paints the screen instead of disappearing?
 # payload.py shells out to <tree>/scripts/patch-xnu-entry-probe.py, which does
@@ -203,8 +226,14 @@ kernel_args = [
   #   17 (erhai): DME_HIBERNATE_EXIT first, then the same reads.
   #     -> Hibern8 exit completes, the peer answers and the CPort is connected: the
   #        firmware leaves the link in Hibern8. uicWakeLink now does this before NOP OUT.
-  #   Next: probe 10 (GPT) with the identity stage-1 context.
-  "native-ufs-probe=10",
+  #   probe 10 (2026-10-23, after the wake): GPT read, userdata 0x3798e8..0x3adb7fa.
+  # The UFS root itself (no probe level): NativeUfs publishes the verified OS and
+  # SystemOS windows of userdata. sheng-pmgr=2 publishes the original PMGR nub
+  # AMFI requires (payload.py refuses native-ufs-root=1 without it), and
+  # offline-apfs-load loads the prelinked APFS before the root is looked up.
+  "native-ufs-root=1",
+  "sheng-pmgr=2",
+  "offline-apfs-load=1",
   "native-ufs-smmu=2",
   # Print the transport/SMMU snapshot when a probe or the root path fails.
   "native-ufs-diagnostics=1",
@@ -233,6 +262,10 @@ owned_memory_size = "0x100000000"
 # is told cpus=1 leaves seven CPUs in the ADT that nothing ever brings online,
 # and any Apple kext that waits on secondaries times out on them.
 cpu_regs = "0"
+# The APFS volume UUID of the IPSW's OS image (044-76040-038.dmg), published by NativeUfs from the
+# userdata OS window. Without it the root matcher falls back to IOMedia Content=Apple_HFS, which the
+# APFS volume never satisfies (hardware 2026-10-23: root device wait timeout, NativeUfs silent).
+root_match_volume_uuid = "04769D26-2CA0-4825-B443-E2E5F88300F2"
 packed_data_ramdisk = true
 ipad_identity = true
 trust_cache = true
