@@ -28,6 +28,10 @@ CONFIG_XNU_OWNER_ROOT_TRUST=y
 CONFIG_XNU_TRUST_CACHE_RUNTIME=y
 CONFIG_XNU_NATIVE_CS_HASH_CACHE=y
 CONFIG_XNU_SHENG_PMGR=y
+# Oryon implements PAN. Without native PAN the kernel leaves SCTLR_EL1.SPAN clear, so every exception
+# into EL1 sets PSTATE.PAN and nothing clears it: launchd's exec looped forever on a level-3
+# permission fault in copyinstr (ESR 0x9600000f, FAR 0x1000), as sheng's defconfig already avoids.
+CONFIG_XNU_NATIVE_PAN=y
 CONFIG_XNU_OWNER_CACHE_MOUNT=y
 CONFIG_XNU_OWNER_CACHE_STARTUP=y
 CONFIG_XNU_OWNER_BOOT_MANIFEST=y
