@@ -12,7 +12,7 @@ CONFIG_XNU_DT_PANIC_REGION=y
 # second registration trips assert(!prng_ready) at early_boot (run-3).
 CONFIG_XNU_CRYPTO_BOOTSTRAP="prelinked"
 # CONFIG_XNU_ARMVIRT_PLATFORM is not set
-# CONFIG_XNU_NATIVE_UFS is not set
+CONFIG_XNU_NATIVE_UFS=y
 # CONFIG_XNU_NATIVE_AES is not set
 # CONFIG_XNU_NATIVE_ADRENO is not set
 CONFIG_XNU_BOOT_PROGRESS=y

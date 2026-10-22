@@ -88,6 +88,8 @@ def main():
     trees = prepared_trees()
     if trees:
         scripts = {p.name for p in (trees[0] / 'scripts').glob('*.py')}
+        # The device's own scripts/ overlays the tree at build time (build-arm-driver.py).
+        scripts |= {p.name for p in (DEVICE / 'scripts').glob('*.py')}
         print(f'tree: {trees[0].name} ({len(scripts)} scripts)')
         for entry in kernel.get('archives', []):
             name = entry.split()[0]

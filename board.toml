@@ -55,6 +55,10 @@ archives = [
   "build-arm-platform.py",
   "build-boot-progress.py",
   "build-libpthread-kernel.py",
+  # NativeUfs (erhai copy, drivers/NativeUfs) for the read-only probe boots:
+  # no verified-root policy yet, so it can inspect and read but never publish
+  # a root. Swap for the verified build once the root image exists.
+  "build-arm-driver.py NativeUfs --probe-only",
 ]
 
 # The prelink is what makes the payload kernel carry Apple's own kexts.
@@ -173,6 +177,12 @@ kernel_args = [
   # Lets the xnu build print through early boot instead of buffering into a
   # zone that does not exist yet — the cheapest way to see where a hang is.
   "-enable_kprintf_spam",
+  # UFS bring-up step, one boot per level (drivers/NativeUfs start()); each
+  # panics with its report and writes nothing.
+  #   2 (2026-10-23): GDSCs on, UFS clocks running, UFSHCI 4.0, 32 slots,
+  #     64-bit DMA, HCS=0x10f, HCE=1: the controller and link are left up.
+  #   10: adopt the controller, SMMU bypass, LUN 0 GPT -> userdata -> block 0.
+  "native-ufs-probe=10",
 ]
 
 [payload.adt]
