@@ -8,7 +8,7 @@
 #include "../SmmuTakeover.h"
 int main()
 {
-  std::array<uint32_t,0xd0000/4> r{};
+  std::array<uint32_t,UFS_SMMU_SIZE/4> r{};
   auto reset=[&] {r.fill(0); r[0x20/4]=0x40000080; r[0x24/4]=0x60000046; r[0x28/4]=0x5111;};
   auto plan=[&] {return planUfsSmmu(0x60,0x8cb5e9000ULL,0x22000,[&](unsigned at){return r.at(at/4);});};
   reset(); auto p=plan(); assert(!p.error && !p.reuse && p.slot==127 && p.bank==69);

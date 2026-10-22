@@ -68,6 +68,8 @@ class NativeUfs : public IOService {
   void dumpFirmwareList (void);
   void inspectSmmu (void);
   void inspectContextBanks (void);
+  void dumpSmmuStreams (void);
+  void dumpUicState (bool hibernateExit);
   bool startRoot (IOService *provider);
   static bool waitSet (uintptr_t base, unsigned offset, uint32_t mask, unsigned loops);
 public:
@@ -281,9 +283,20 @@ static void zero32 (void *start, size_t length)
 static void smmuBypassStream (uint16_t stream, OSSharedPtr<IOMemoryMap> &keep, uint32_t *report,
                               uint64_t dma, uint64_t bytes)
 {
-  uintptr_t smmu = mapPhys (0x15000000ULL, 0xd0000, keep);
+  uintptr_t smmu = mapPhys (UFS_SMMU_BASE, UFS_SMMU_SIZE, keep);
   if (!smmu) {
     panic ("NATIVE_UFS smmu: map failed");
+  }
+  // erhai bring-up: native-ufs-smmu=0 leaves the SMMU exactly as the firmware handed it over
+  // (no stream-match entry for the UFS stream) and reports sCR0 instead, to tell whether our
+  // bypass mapping is what stops the controller's DMA.
+  unsigned smmuMode = 1;
+  PE_parse_boot_argn ("native-ufs-smmu", &smmuMode, sizeof (smmuMode));
+  if (smmuMode == 0) {
+    report[0] = 0xffffffffU;
+    report[1] = read32 (smmu, 0x0);   // sCR0
+    report[2] = read32 (smmu, 0x20);  // IDR0
+    return;
   }
   UfsSmmuPlan plan = planUfsSmmu (stream, dma, bytes, [smmu](unsigned offset) { return read32 (smmu, offset); });
   gRootDiagnostic.smmuId1 = read32 (smmu, 0x24);
@@ -294,7 +307,8 @@ static void smmuBypassStream (uint16_t stream, OSSharedPtr<IOMemoryMap> &keep, u
     gRootDiagnostic.result = static_cast<uint32_t> (kIOReturnNotReady);
     gRootDiagnostic.smr = plan.smr; gRootDiagnostic.s2cr = plan.s2cr;
     rootDiagnosticFailure (plan.error);
-    panic ("NATIVE_UFS smmu: %s slot=%u smr=%x s2cr=%x", plan.error, plan.slot, plan.smr, plan.s2cr);
+    panic ("NATIVE_UFS smmu: %s slot=%u smr=%x s2cr=%x idr0=%x idr1=%x idr2=%x", plan.error, plan.slot, plan.smr, plan.s2cr,
+           read32 (smmu, 0x20), gRootDiagnostic.smmuId1, gRootDiagnostic.smmuId2);
   }
   unsigned bank = plan.bank, index = plan.slot;
   uintptr_t cb = smmu + (plan.pages + bank) * 4096;
@@ -317,9 +331,118 @@ static void smmuBypassStream (uint16_t stream, OSSharedPtr<IOMemoryMap> &keep, u
     panic ("NATIVE_UFS smmu: %s idx=%u bank=%u cba2r=%x", failure, index, bank,
            gRootDiagnostic.cba2r);
   }
+  // erhai bring-up: native-ufs-smmu=2 turns that bank into an identity-mapped stage-1 context (one
+  // level-1 table of 1 GiB blocks over the whole input range) instead of SCTLR.M=0 pass-through.
+  // Hardware 2026-10-23: with the pass-through bank the first command's DMA stalls silently (no
+  // context or global fault) on SM8750; Linux drives this SMMU with translating contexts only.
+  if (smmuMode >= 2 && smmuMode <= 4) {
+    unsigned ias = ufsSmmuAddressBits (read32 (smmu, 0x28) & 15);
+    if (ias < 32 || ias > 39) {
+      panic ("NATIVE_UFS smmu: identity map needs 32..39-bit input, idr2=%x", read32 (smmu, 0x28));
+    }
+    static IOBufferMemoryDescriptor *table;
+    if (!table) {
+      table = IOBufferMemoryDescriptor::inTaskWithOptions (
+        kernel_task, static_cast<IOOptionBits> (kIODirectionInOut) | static_cast<IOOptionBits> (kIOMemoryPhysicallyContiguous) |
+        static_cast<IOOptionBits> (kIOMemoryMapperNone), 8192, 4096);
+    }
+    uint64_t *entry = table ? static_cast<uint64_t *> (table->getBytesNoCopy ()) : nullptr;
+    IOByteCount contiguous = 0;
+    uint64_t tablePhys = table ? table->getPhysicalSegment (0, &contiguous, kIOMemoryMapperNone) : 0;
+    if (!entry || !tablePhys || (tablePhys & 4095)) {
+      panic ("NATIVE_UFS smmu: identity table allocation");
+    }
+    // Hardware 2026-10-23: a single level-1 page with T0SZ for the 36-bit IDR2.IAS faulted
+    // (FSR TF, FSYNR0.PLVL=0): the walk really starts at level 0. Page 0 therefore works as
+    // either: entry 0 is a table pointing at page 1 (level 0 reading: 0..512 GiB), entries
+    // 1.. are 1 GiB blocks (level 1 reading; DMA never sits in the first GiB). Page 1 holds
+    // the 512 level-1 blocks. Block: AttrIndx 0 (write-back), AP=01, inner shareable, AF.
+    // native-ufs-smmu=4: blocks use AttrIndx 1 (normal non-cacheable, MAIR0 byte 1 = 0x44) so the
+    // controller's DMA avoids the IO-coherent (snooping) path. Hardware 2026-10-23: with
+    // write-back blocks the walk works (smmu=3 control faults as expected) yet the data access
+    // after a successful translation stalls silently.
+    uint64_t block = smmuMode == 4 ? 0x745 : 0x741;
+    for (unsigned index = 0; index < 512; index++) {
+      entry[index] = index ? ((uint64_t (index) << 30) | block) : ((tablePhys + 4096) | 3);
+      entry[512 + index] = (uint64_t (index) << 30) | block;
+    }
+    if (smmuMode == 3) {
+      // Control run: the walk itself still has to read both table pages, but the DMA's GiB is
+      // left invalid, so a working walker must report a level-1 translation fault.
+      entry[dma >> 30] = 0;
+      entry[512 + (dma >> 30)] = 0;
+    }
+    cacheClean (entry, 8192);
+    auto put = [cb] (unsigned offset, uint32_t value) {
+      write32 (cb, offset, value);
+      __asm__ volatile ("dsb sy" ::: "memory");
+    };
+    put (0x0, 0);                                         // SCTLR off while programming
+    // TCR2: PASize = IDR2.OAS, SEP = upstream (7). Hardware 2026-10-23: with SEP=0 (sign bit 31)
+    // the DMA address 0x8c806a000 was taken as a TTBR1 address and faulted at level 0 (EPD1).
+    put (0x10, ((read32 (smmu, 0x28) >> 4) & 7) | (7U << 15));
+    put (0x20, static_cast<uint32_t> (tablePhys));        // TTBR0, ASID 0
+    put (0x24, static_cast<uint32_t> (tablePhys >> 32));
+    put (0x28, 0);
+    put (0x2c, 0);
+    uint32_t tcr = (64 - ias) | (1U << 8) | (1U << 10) | (3U << 12) | (1U << 23);  // T0SZ, WB walks, IS, 4K, EPD1
+    put (0x30, tcr);
+    put (0x34, 0);
+    put (0x38, 0x0444ff);                                 // MAIR0: attr0 WB, attr1 NC, attr2 device
+    put (0x3c, 0);
+    put (0x58, read32 (cb, 0x58));                        // clear stale FSR
+    put (0x618, 0);                                       // TLBIALL
+    put (0x7f0, 0);                                       // TLBSYNC
+    for (unsigned loops = 0; (read32 (cb, 0x7f4) & 1) && loops < 100000; loops++) IODelay (1);
+    put (0x0, 0x67);                                      // M | TRE | AFE | CFRE | CFIE, faults terminate
+    sctlr = read32 (cb, 0x0);
+    if (sctlr != 0x67 || read32 (cb, 0x30) != tcr) {
+      panic ("NATIVE_UFS smmu: identity context readback sctlr=%x tcr=%x ttbr0=%x", sctlr, read32 (cb, 0x30), read32 (cb, 0x20));
+    }
+    gRootDiagnostic.sctlr = sctlr;
+  }
   report[0] = index | (bank << 16);
   report[1] = cbar;
   report[2] = sctlr;
+}
+
+// One UIC command (UFSHCI 5.6: UICCMD 0x90, UCMDARG1..3 0x94..0x9c, IS.UCCS bit 10). Returns
+// false on a timeout; the result code (UCMDARG2 bits 7:0) and value (UCMDARG3) go to the caller.
+static bool uicCommand (uintptr_t hc, uint32_t opcode, uint32_t arg1, uint32_t *result, uint32_t *value)
+{
+  unsigned wait = 0;
+  while (!(read32 (hc, 0x30) & 0x8) && wait++ < 100000) IODelay (1);
+  if (!(read32 (hc, 0x30) & 0x8)) return false;
+  write32 (hc, 0x20, 0x4b0);  // clear UCCS, UHXS, UHES, UPMS
+  write32 (hc, 0x94, arg1);
+  write32 (hc, 0x98, 0);
+  write32 (hc, 0x9c, 0);
+  __asm__ volatile ("dsb sy" ::: "memory");
+  write32 (hc, 0x90, opcode);
+  wait = 0;
+  while (!(read32 (hc, 0x20) & 0x400) && wait++ < 200000) IODelay (1);
+  if (!(read32 (hc, 0x20) & 0x400)) return false;
+  if (result) *result = read32 (hc, 0x98) & 0xff;
+  if (value) *value = read32 (hc, 0x9c);
+  return true;
+}
+
+// erhai: the firmware hands over the UniPro link in Hibern8. Hardware 2026-10-23 (probes 16/17): local
+// PA_PWRMODE 0x11 (FAST, HS-G5 x2) but DME_PEER_GET fails with PEER_COMMUNICATION_FAILURE and
+// T_CONNECTIONSTATE is 0, so NOP OUT is fetched and never answered; DME_HIBERNATE_EXIT completes
+// (IS.UHXS, HCS.UPMCRS = PWR_LOCAL) and the peer then answers with the CPort connected. When the
+// peer already answers nothing is sent. Returns a reason on failure.
+static const char *uicWakeLink (uintptr_t hc)
+{
+  uint32_t result = 0xff;
+  if (uicCommand (hc, 0x03, 0x1571U << 16, &result, nullptr) && result == 0) return nullptr;
+  if (!uicCommand (hc, 0x18, 0, nullptr, nullptr)) return "Hibern8 exit timeout";
+  unsigned wait = 0;
+  while (!(read32 (hc, 0x20) & 0x20) && wait++ < 200000) IODelay (1);
+  if (!(read32 (hc, 0x20) & 0x20) || ((read32 (hc, 0x30) >> 8) & 7) != 1) return "Hibern8 exit status";
+  result = 0xff;
+  if (!uicCommand (hc, 0x03, 0x1571U << 16, &result, nullptr) || result != 0) return "peer silent after Hibern8 exit";
+  return nullptr;
 }
 
 void NativeUfs::adoptAndRead (unsigned level)
@@ -368,6 +491,9 @@ void NativeUfs::adoptAndRead (unsigned level)
   while ((read32 (hc, 0x60) & 1) && stopLoops--) IODelay (10);
   if (read32 (hc, 0x60) & 1) panic ("NATIVE_UFS adopt: request list did not stop");
   smmuBypassStream (0x60, smmuMap, smmuReport, phys, 16384);
+  if (const char *wake = uicWakeLink (hc)) {
+    panic ("NATIVE_UFS adopt: %s is=%08x hcs=%08x", wake, read32 (hc, 0x20), read32 (hc, 0x30));
+  }
   write32 (hc, 0x50, static_cast<uint32_t> (phys));
   write32 (hc, 0x54, static_cast<uint32_t> (phys >> 32));
   write32 (hc, 0x20, 0xffffffffU);  // clear stale status
@@ -716,7 +842,7 @@ void NativeUfs::dumpFirmwareList (void)
 void NativeUfs::inspectSmmu (void)
 {
   OSSharedPtr<IOMemoryMap> map;
-  uintptr_t smmu = mapPhys (0x15000000ULL, 0x1000, map);
+  uintptr_t smmu = mapPhys (UFS_SMMU_BASE, 0x1000, map);
   if (!smmu) {
     panic ("NATIVE_UFS smmu: map failed");
   }
@@ -752,17 +878,127 @@ void NativeUfs::inspectSmmu (void)
 
 // Read-only context-bank survey (native-ufs-probe=8): CBAR/CBA2R in gr1 and SCTLR/TTBR0 in the
 // context banks, to find a bank the hypervisor leaves to us. Nothing is written.
+// erhai probe 15 (read-only): the whole stream-routing picture in one panic. Global registers,
+// every valid stream-match entry (index:SMR/S2CR; S2CR type 0 = context bank, 1 = bypass,
+// 2 = fault), and the top context banks a UFS mapping would take. Nothing is written.
+void NativeUfs::dumpSmmuStreams (void)
+{
+  OSSharedPtr<IOMemoryMap> map;
+  uintptr_t smmu = mapPhys (UFS_SMMU_BASE, UFS_SMMU_SIZE, map);
+  if (!smmu) {
+    panic ("NATIVE_UFS streams: map failed");
+  }
+  uint32_t idr0 = read32 (smmu, 0x20), idr1 = read32 (smmu, 0x24);
+  unsigned count = idr0 & 0xff, numCb = idr1 & 0xff;
+  unsigned pages = 1U << (((idr1 >> 28) & 7) + 1);
+  if (count > 128) count = 128;
+  if (numCb > 128 || (pages + numCb) * 0x1000 > UFS_SMMU_SIZE) {
+    panic ("NATIVE_UFS streams: unexpected geometry idr1=%08x", idr1);
+  }
+  static char text[2400];
+  int used = snprintf (text, sizeof (text),
+                       "NATIVE_UFS streams\nscr0=%08x scr2=%08x idr0=%08x idr1=%08x idr2=%08x\ngfsr=%08x gfsynr0=%08x nsmr=%u ncb=%u pages=%u\n",
+                       read32 (smmu, 0x0), read32 (smmu, 0x8), idr0, idr1, read32 (smmu, 0x28),
+                       read32 (smmu, 0x48), read32 (smmu, 0x50), count, numCb, pages);
+  unsigned shown = 0, valid = 0, types[4] = {0, 0, 0, 0};
+  for (unsigned index = 0; index < count; index++) {
+    uint32_t smr = read32 (smmu, 0x800 + 4 * index);
+    if (!(smr & 0x80000000U)) continue;
+    uint32_t s2cr = read32 (smmu, 0xc00 + 4 * index);
+    valid++;
+    types[(s2cr >> 16) & 3]++;
+    if (shown < 30 && used < int (sizeof (text)) - 400) {
+      used += snprintf (text + used, sizeof (text) - used, "%u:%x/%x%s", index, smr & 0x7fffffffU, s2cr,
+                        (++shown % 4) ? "  " : "\n");
+    }
+  }
+  used += snprintf (text + used, sizeof (text) - used, "\nvalid=%u t0=%u t1=%u t2=%u\n", valid, types[0], types[1], types[2]);
+  for (unsigned back = 1; back <= 4 && back <= numCb; back++) {
+    unsigned bank = numCb - back;
+    uintptr_t cb = smmu + (pages + bank) * 0x1000;
+    used += snprintf (text + used, sizeof (text) - used, "cb%u cbar=%08x cba2r=%08x sctlr=%08x actlr=%08x fsr=%08x\n",
+                      bank, read32 (smmu, 0x1000 + 4 * bank), read32 (smmu, 0x1800 + 4 * bank),
+                      read32 (cb, 0x0), read32 (cb, 0x4), read32 (cb, 0x58));
+  }
+  panic ("%s", text);
+}
+
+// erhai probe 16 (read-only): the UniPro link as the firmware left it, through UIC DME_GET /
+// DME_PEER_GET (UFSHCI 5.6: UICCMD 0x90, UCMDARG1..3 0x94..0x9c, IS.UCCS bit 10). Hardware
+// 2026-10-23: with a working stage-1 mapping NOP OUT is fetched (a deliberately broken table
+// faults on the request list) yet never completes, so check whether the link is up at all.
+void NativeUfs::dumpUicState (bool hibernateExit)
+{
+  OSSharedPtr<IOMemoryMap> map;
+  uintptr_t hc = mapPhys (UFS_HC_BASE, UFS_HC_SIZE, map);
+  if (!hc) {
+    panic ("NATIVE_UFS uic: map failed");
+  }
+  uint32_t hcs = read32 (hc, 0x30), is = read32 (hc, 0x20);
+  static char text[1600];
+  int used = snprintf (text, sizeof (text), "NATIVE_UFS uic\nhcs=%08x is=%08x hce=%08x ahit=%08x uecpa=%08x uecdl=%08x\n",
+                       hcs, is, read32 (hc, 0x34), read32 (hc, 0x18), read32 (hc, 0x38), read32 (hc, 0x3c));
+  // Probe 17: hardware 2026-10-23 (probe 16) showed a FAST HS-G5 x2 link whose peer does not answer
+  // (DME_PEER_GET = PEER_COMMUNICATION_FAILURE) and T_CONNECTIONSTATE 0, as if the firmware left the
+  // link in Hibern8. Send DME_HIBERNATE_EXIT (0x18) and report its completion (IS.UHXS bit 5,
+  // IS.UPMS bit 4, HCS.UPMCRS) before the same reads.
+  if (hibernateExit) {
+    unsigned wait = 0;
+    while (!(read32 (hc, 0x30) & 0x8) && wait++ < 100000) IODelay (1);
+    write32 (hc, 0x20, 0x4b0);                         // clear UCCS, UHXS, UHES, UPMS
+    write32 (hc, 0x94, 0);
+    write32 (hc, 0x98, 0);
+    write32 (hc, 0x9c, 0);
+    __asm__ volatile ("dsb sy" ::: "memory");
+    write32 (hc, 0x90, 0x18);
+    wait = 0;
+    while (!(read32 (hc, 0x20) & 0x20) && wait++ < 200000) IODelay (1);
+    used += snprintf (text + used, sizeof (text) - used, "h8exit is=%08x hcs=%08x arg2=%x waited=%u\n",
+                      read32 (hc, 0x20), read32 (hc, 0x30), read32 (hc, 0x98), wait);
+  }
+  struct Attribute { uint16_t id; bool peer; const char *name; };
+  static const Attribute attributes[] = {
+    {0x1571, false, "pwrmode"}, {0x1568, false, "txgear"}, {0x1583, false, "rxgear"},
+    {0x1561, false, "contx"}, {0x1581, false, "conrx"}, {0x1560, false, "acttx"}, {0x1580, false, "actrx"},
+    {0x156a, false, "hsseries"}, {0x4020, false, "tconn"}, {0xd083, false, "vspwr"}, {0x15a7, false, "hib8time"},
+    {0x1571, true, "peer-pwrmode"}, {0x4020, true, "peer-tconn"},
+  };
+  unsigned column = 0;
+  for (const Attribute &attribute : attributes) {
+    unsigned wait = 0;
+    while (!(read32 (hc, 0x30) & 0x8) && wait++ < 100000) IODelay (1);
+    if (!(read32 (hc, 0x30) & 0x8)) {
+      used += snprintf (text + used, sizeof (text) - used, "\n%s: UCRDY never set", attribute.name);
+      break;
+    }
+    write32 (hc, 0x20, 0x400);                         // clear UCCS
+    write32 (hc, 0x94, uint32_t (attribute.id) << 16);  // MIB attribute, selector 0
+    write32 (hc, 0x98, 0);
+    write32 (hc, 0x9c, 0);
+    __asm__ volatile ("dsb sy" ::: "memory");
+    write32 (hc, 0x90, attribute.peer ? 0x03 : 0x01);   // DME_PEER_GET / DME_GET
+    wait = 0;
+    while (!(read32 (hc, 0x20) & 0x400) && wait++ < 100000) IODelay (1);
+    bool done = read32 (hc, 0x20) & 0x400;
+    used += snprintf (text + used, sizeof (text) - used, "%s=%s%x/%x%s", attribute.name, done ? "" : "TIMEOUT ",
+                      read32 (hc, 0x98) & 0xff, read32 (hc, 0x9c), (++column % 4) ? "  " : "\n");
+    if (!done) break;
+  }
+  used += snprintf (text + used, sizeof (text) - used, "\nafter is=%08x hcs=%08x", read32 (hc, 0x20), read32 (hc, 0x30));
+  panic ("%s", text);
+}
+
 void NativeUfs::inspectContextBanks (void)
 {
   OSSharedPtr<IOMemoryMap> map;
-  uintptr_t smmu = mapPhys (0x15000000ULL, 0xd0000, map);
+  uintptr_t smmu = mapPhys (UFS_SMMU_BASE, UFS_SMMU_SIZE, map);
   if (!smmu) {
     panic ("NATIVE_UFS cb: map failed");
   }
   uint32_t idr1 = read32 (smmu, 0x24);
   unsigned numCb = idr1 & 0xff;
   unsigned globalPages = 1U << (((idr1 >> 28) & 7) + 1);
-  if (globalPages > 128 || numCb > 128 || (globalPages + numCb) * 0x1000 > 0xd0000) {
+  if (globalPages > 128 || numCb > 128 || (globalPages + numCb) * 0x1000 > UFS_SMMU_SIZE) {
     panic ("NATIVE_UFS cb: unexpected geometry idr1=%08x", idr1);
   }
   unsigned cbarZero = 0, sctlrZero = 0, mSet = 0, bothZero = 0;
@@ -930,12 +1166,22 @@ static bool hostBringUp (const char **why)
   smmuBypassStream (0x60, gHost.smmuMap, report, gHost.phys, kDmaBytes);
   gHost.smmu = gHost.smmuMap->getVirtualAddress ();
   uint32_t idr1 = read32 (gHost.smmu, 0x24);
-  gHost.cb = gHost.smmu + ((1U << (((idr1 >> 28) & 7) + 1)) + (report[0] >> 16)) * 4096;
+  // native-ufs-smmu=0 configured no bank: leave cb unset so the fault snapshot skips it.
+  gHost.cb = report[0] == 0xffffffffU ? 0 : gHost.smmu + ((1U << (((idr1 >> 28) & 7) + 1)) + (report[0] >> 16)) * 4096;
   if (gRootDiagnosticEnabled) {
     gRootDiagnostic.gfsrBefore = read32 (gHost.smmu, 0x48);
-    gRootDiagnostic.fsrBefore = read32 (gHost.cb, 0x58);
     gRootDiagnostic.smmuId2 = read32 (gHost.smmu, 0x28);
-    gRootDiagnostic.cba2r = read32 (gHost.smmu, 0x1800 + 4 * (report[0] >> 16));
+    if (gHost.cb) {
+      gRootDiagnostic.fsrBefore = read32 (gHost.cb, 0x58);
+      gRootDiagnostic.cba2r = read32 (gHost.smmu, 0x1800 + 4 * (report[0] >> 16));
+    } else {
+      gRootDiagnostic.cbar = report[1];  // native-ufs-smmu=0: sCR0 in the cbar field
+    }
+  }
+  gRootDiagnostic.stage = "link wake";
+  if (const char *wake = uicWakeLink (gHost.hc)) {
+    *why = wake;
+    return false;
   }
   if (!hostStartQueue (why)) return false;
   gRootDiagnostic.stage = "NOP OUT";
@@ -1760,6 +2006,12 @@ bool NativeUfs::start (IOService *provider)
   if (probe == 7) {
     inspectSmmu ();
   }
+  if (probe == 15) {
+    dumpSmmuStreams ();
+  }
+  if (probe == 16 || probe == 17) {
+    dumpUicState (probe == 17);
+  }
   if (probe == 6) {
     dumpFirmwareList ();
   }
@@ -1770,6 +2022,8 @@ bool NativeUfs::start (IOService *provider)
     // Read-only check before anything is flashed: LUN 0 GPT -> "userdata" -> its first block.
     const char *why = "";
     if (!hostBringUp (&why)) {
+      // native-ufs-diagnostics=1: the full transport/SMMU snapshot instead of the bare reason.
+      rootDiagnosticFailure (why);
       panic ("NATIVE_UFS root check: bring-up failed: %s", why);
     }
     RootLayout *layout = static_cast<RootLayout *> (IOMalloc (sizeof (RootLayout)));
@@ -1788,6 +2042,8 @@ bool NativeUfs::start (IOService *provider)
     // attached dmg disk image carries "EFI PART"). Read-only.
     const char *why = "";
     if (!hostBringUp (&why)) {
+      // native-ufs-diagnostics=1: the full transport/SMMU snapshot instead of the bare reason.
+      rootDiagnosticFailure (why);
       panic ("NATIVE_UFS root windows: bring-up failed: %s", why);
     }
     RootLayout *layout = static_cast<RootLayout *> (IOMalloc (sizeof (RootLayout)));

@@ -1,5 +1,10 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
 // Plan before any SMMU write. Interface register facts: ARM SMMUv2.
+#ifndef UFS_SMMU_BASE
+// apps-smmu@15000000 reg = <0x15000000 0x100000> in the erhai live DT (sheng mapped 0xd0000).
+#define UFS_SMMU_BASE 0x15000000ULL
+#define UFS_SMMU_SIZE 0x100000U
+#endif
 struct UfsSmmuPlan {
   unsigned slot = 0xffffffffU, bank = 0, pages = 0;
   uint32_t smr = 0, s2cr = 0;
@@ -37,7 +42,7 @@ static UfsSmmuPlan planUfsSmmuBank(uint16_t stream, uint64_t dma, uint64_t bytes
   unsigned banks = idr1 & 255;
   p.pages = 1U << (((idr1 >> 28) & 7) + 1);
   if ((idr1 >> 31) || !count || p.pages > 128 || banks < 2 || banks > 128 ||
-      (p.pages + banks) * 4096 > 0xd0000) {
+      (p.pages + banks) * 4096 > UFS_SMMU_SIZE) {
     p.error = "unsupported SMMU geometry"; return p;
   }
   if (count > 128) count = 128; // Firmware's reliably accessible groups only.

@@ -182,7 +182,32 @@ kernel_args = [
   #   2 (2026-10-23): GDSCs on, UFS clocks running, UFSHCI 4.0, 32 slots,
   #     64-bit DMA, HCS=0x10f, HCE=1: the controller and link are left up.
   #   10: adopt the controller, SMMU bypass, LUN 0 GPT -> userdata -> block 0.
+  #     First run: SMMU window 0xd0000 too small (erhai DT: 0x100000), fixed.
+  #     Second run: SMMU bypass OK, the first command (NOP OUT) failed.
+  #     Third run (diagnostics): timeout, DB stays 1, IS=0, OCS untouched, no
+  #     SMMU fault; DMA buffer at 0x8c806a000 (high DRAM).
+  #   4: TEST UNIT READY through the firmware's own list memory (0xd652a000),
+  #     to tell DMA reachability of high DRAM from a transport problem.
+  #     Result: same stall (DB=1, IS=0), so not the address.
+  #     With the SMMU left as handed over (native-ufs-smmu=0): the tablet reset
+  #     itself on the first command, so an unmatched UFS stream is fatal here.
+  #   15 (erhai): read-only dump of every SMMU stream mapping and the top banks: only one
+  #     valid entry (SID 0x800 -> bank 3); the UFS stream 0x60 is not visible to us.
+  #   Next: probe 10 with an identity-mapped stage-1 context (native-ufs-smmu=2).
+  #   smmu=2 (identity stage 1, TCR2.SEP fixed): NOP OUT stalls again, no fault visible.
+  #   smmu=3: same tables with the DMA's GiB invalid, to see whether the walker can read them.
+  #     -> level-1 translation fault at the request list as expected: the walker works.
+  #   smmu=4: identity stage 1 with non-cacheable blocks -> stalls the same way.
+  #   16 (erhai): read-only UIC DME_GET dump of the link state.
+  #     -> FAST HS-G5 x2, T_CONNECTIONSTATE 0, peer gets fail (0xa): the device does not answer.
+  #   17 (erhai): DME_HIBERNATE_EXIT first, then the same reads.
+  #     -> Hibern8 exit completes, the peer answers and the CPort is connected: the
+  #        firmware leaves the link in Hibern8. uicWakeLink now does this before NOP OUT.
+  #   Next: probe 10 (GPT) with the identity stage-1 context.
   "native-ufs-probe=10",
+  "native-ufs-smmu=2",
+  # Print the transport/SMMU snapshot when a probe or the root path fails.
+  "native-ufs-diagnostics=1",
 ]
 
 [payload.adt]
