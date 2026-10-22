@@ -3320,3 +3320,27 @@ index 0000000..7f3b4a9
 +
 +if __name__ == '__main__':
 +    main()
+diff --git a/patches/xnu/zzzzzz-boot-progress-framebuffer-va.patch b/patches/xnu/zzzzzz-boot-progress-framebuffer-va.patch
+new file mode 100644
+--- /dev/null
++++ b/patches/xnu/zzzzzz-boot-progress-framebuffer-va.patch
+@@ -0,0 +1,19 @@
++diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
++index a688021..49403ec 100644
++--- a/osfmk/arm64/arm_vm_init.c
+++++ b/osfmk/arm64/arm_vm_init.c
++@@ -2268,6 +2268,14 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
++ 	va_l1 = dynamic_memory_begin;
++ 	va_l1_end = va_l1 + ((2 + (mem_segments * 10)) << 20);
++ 	va_l1_end += round_page(args->Video.v_height * args->Video.v_rowBytes);
+++#if defined(XNU_EARLY_BOOT_PROGRESS) && XNU_EARLY_BOOT_PROGRESS
+++	/*
+++	 * BootProgress maps the boot framebuffer right after arm_vm_init, before
+++	 * the video console maps it again, so both mappings come out of these
+++	 * bootstrap L3 tables.
+++	 */
+++	va_l1_end += round_page(args->Video.v_height * args->Video.v_rowBytes);
+++#endif
++ 	va_l1_end = (va_l1_end + 0x00000000007FFFFFULL) & 0xFFFFFFFFFF800000ULL;
++ 
++ 	cpu_l1_tte = cpu_tte + ((va_l1 & ARM_TT_L1_INDEX_MASK) >> ARM_TT_L1_SHIFT);
