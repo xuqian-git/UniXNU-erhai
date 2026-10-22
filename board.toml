@@ -79,6 +79,9 @@ archives = [
   "build-native-aes-bindings.py",
   "build-arm-driver.py NativeUfs",
   "build-arm-driver.py NativeVirtioBlock",
+  # The RAM-backed Data volume (packed seed from the payload), in sheng's order.
+  "build-arm-driver.py NativeRamBlock",
+  "build-native-virtio-bindings.py --component NativeRamBlock --directory build/native-ram-block",
   "build-native-virtio-bindings.py --component NativeVirtioBlock",
   # Vendored from UniXNU-sheng (drivers/ShengPlatformPower here).
   "build-sheng-platform-power.py",
@@ -140,6 +143,8 @@ volume = "ERHAIESP"
 # sits inside the decompressed region this board's ABL has been booting from.
 # The packer reports the exact requirement if this ever becomes too small.
 size_mib = 192
+# --skip-setup marks Setup done in the Data seed.
+skip_setup_tool = "scripts/seed-data-skip-setup.py"
 loader = "firmware"
 title = "OnePlus Pad 2 Pro: iPad7,1 bring-up"
 # sheng records 0x80000000 as the SMEM RAM-table value on SM8550 hardware and
@@ -237,6 +242,14 @@ kernel_args = [
   "native-ufs-smmu=2",
   # Print the transport/SMMU snapshot when a probe or the root path fails.
   "native-ufs-diagnostics=1",
+  # Data: an ephemeral RAM volume (the packed seed passed with --data-ramdisk, see
+  # CONFIG_XNU_OWNER_DATA_VOLUME_UUID). Without it tzinit exits with EROFS and launchd
+  # panics. Without a system keybag, keybagd needs the shared-datavolume path; the
+  # sheng-* switches are BootWatchdogPolicy.c (drivers/BootProgress): it disables
+  # watchdogd and the network/iCloud jobs this tablet has nothing for.
+  "-apfs_shared_datavolume",
+  "sheng-disable-watchdogd=1",
+  "sheng-lite=1",
 ]
 
 [payload.adt]

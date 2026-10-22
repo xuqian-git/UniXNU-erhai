@@ -32,6 +32,12 @@ CONFIG_XNU_SHENG_PMGR=y
 # into EL1 sets PSTATE.PAN and nothing clears it: launchd's exec looped forever on a level-3
 # permission fault in copyinstr (ESR 0x9600000f, FAR 0x1000), as sheng's defconfig already avoids.
 CONFIG_XNU_NATIVE_PAN=y
+# Writable Data: a RAM block device from the packed seed (out/erhai/data-seed, made by
+# prepare-owner-data-fixture.py + packed_ramdisk.py), mounted at /private/var. The UUID is
+# that seed's volume_uuid (seed.json) and must change with it.
+CONFIG_XNU_NATIVE_RAM_BLOCK=y
+CONFIG_XNU_OWNER_DATA_MOUNT=y
+CONFIG_XNU_OWNER_DATA_VOLUME_UUID="5A6AECE7-BEA6-425E-A5EF-6D26CF1B81D4"
 CONFIG_XNU_OWNER_CACHE_MOUNT=y
 CONFIG_XNU_OWNER_CACHE_STARTUP=y
 CONFIG_XNU_OWNER_BOOT_MANIFEST=y

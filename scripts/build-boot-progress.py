@@ -68,9 +68,30 @@ def main():
             probe_command.append(value)
     probe_command += ['-Wall', '-Wextra', '-Werror', '-mgeneral-regs-only', '-I', str(root / '.cache/xnu-work/osfmk')]
     subprocess.run(probe_command, cwd=record['directory'], check=True)
+    # erhai: sheng_boot_watchdog_policy (vendored BootWatchdogPolicy.c), which kern_exec calls once the
+    # owner Data volume is mounted when boot progress is on. It is BSD code, so it gets kern_exec's flags.
+    policy = output / 'BootWatchdogPolicy.o'
+    policy_record = json.loads((root / 'build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/bsd/DEVELOPMENT/kern_exec.o.json').read_text().strip().rstrip(','))
+    policy_command = []
+    values = iter(policy_record['arguments'])
+    for value in values:
+        if value == policy_record['file']:
+            policy_command.append(str(source / 'BootWatchdogPolicy.c'))
+        elif value in ('-o', '-MF', '-MT', '-MJ'):
+            following = next(values)
+            if value == '-o':
+                policy_command += ['-o', str(policy)]
+        elif value == '-Xclang':
+            following = next(values)
+            if not following.startswith('-W'):
+                policy_command += [value, following]
+        elif not value.startswith('-W'):
+            policy_command.append(value)
+    policy_command += ['-mgeneral-regs-only', '-Wall', '-Wextra', '-Werror']
+    subprocess.run(policy_command, cwd=policy_record['directory'], check=True)
     archive = output / 'libBootProgress.a'
     archive.unlink(missing_ok=True)
-    subprocess.run(['xcrun', 'ar', 'rcs', archive, obj, entry, probe], check=True)
+    subprocess.run(['xcrun', 'ar', 'rcs', archive, obj, entry, probe, policy], check=True)
     print(archive)
 
 
