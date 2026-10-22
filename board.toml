@@ -138,13 +138,17 @@ timeout = 10
 panic_screen = false
 # sheng's own list, minus the flags consumed by patches that exist only in that
 # repository (offline-legacy-*, offline-hid-*, offline-mobile-graphics-*).
-# Kept because they are read by code the two boards share: serial=3 selects the
-# kprintf serial backend sheng writes its early log to, boot-progress=2 turns on
-# the screen checkpoints build-boot-progress.py compiles in, and
+# Kept because they are read by code the two boards share: boot-progress=2 turns
+# on the screen checkpoints build-boot-progress.py compiles in, and
 # armcpu-diagnostics / armcpu-spi-ipi make ArmCpu report the GIC and IPI state.
 #
-# Two values are taken from IssacL04/UniXNU-Pagani_SM8750 (OnePlus 13T, same
+# Three values are taken from IssacL04/UniXNU-Pagani_SM8750 (OnePlus 13T, same
 # SM8750), which already reaches the root-device wait on this SoC:
+#
+#   serial=0  sheng's serial=3 selects a kprintf serial backend this board has
+#       no UART for. On hardware (2026-10-23, run-1 payload) the kernel passed
+#       S1..S6 and then panicked in kprintf setup with "pmap_map_bd
+#       @pmap.c:1931" (no PTE for the early I/O mapping); pagani boots with 0.
 #
 #   kt_fixed_zones=240  sheng's 120 is below what a source XNU needs. The type
 #       allocator asserts n_zones_sig + n_zones_type + 1 <= 32 (kalloc.c:1779);
@@ -158,7 +162,7 @@ panic_screen = false
 #       publishes one CPU for the same reason (cpu_regs = "0" below).
 kernel_args = [
   "-v",
-  "serial=3",
+  "serial=0",
   "debug=0x14e",
   "kt_fixed_zones=240",
   "boot-progress=2",
