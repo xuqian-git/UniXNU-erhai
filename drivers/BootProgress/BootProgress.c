@@ -8,6 +8,7 @@
 #include <machine/machine_routines.h>
 #include <kern/clock.h>
 #include <kern/thread_call.h>
+#include <kern/thread.h>
 #include <kern/boot_progress.h>
 #include <kern/early_boot_progress.h>
 #include <arm64/proc_reg.h>
@@ -33,7 +34,12 @@ static unsigned width, height, stride, column, row = 4;
 static uint64_t poll_count;
 static thread_call_t poll_call;
 static int busy; // shortcut: single-core observer, add SMP synchronization before enabling more CPUs.
-enum { SCALE = 3, CELL = 6 * SCALE, LINE = 14 * SCALE, LOG_TOP = 4 };
+// Rows 0-3: title, poll counters, platform state, root stage. Rows 4-8: the userspace summary
+// (row 4) and the last four process exits (rows 5-8). Rows 9-11: BootProcessProbe's thread state of
+// launchd, backboardd and SpringBoard; row 12: the thread the last interrupt hit,
+// row 13: its kernel backtrace. All pinned above
+// the scrolling log.
+enum { SCALE = 3, CELL = 6 * SCALE, LINE = 14 * SCALE, USER_ROW = 4, EXIT_ROWS = 4, PROCESS_ROW = 9, PROCESS_ROWS = 3, CPU_ROW = 12, FRAMES_ROW = 13, LOG_TOP = 14 };
 enum { HISTORY = 8, STAGE_BYTES = 80 };
 static char stages[HISTORY][STAGE_BYTES], root_stage[STAGE_BYTES], root_detail[192];
 static unsigned stage_count, panic_state, panic_limit, panic_clipped;
@@ -41,6 +47,46 @@ static uint64_t root_sequence, root_value, root_tick, fault_esr, fault_pc, fault
 static int fault_valid;
 char boot_progress_panic_text[2048];
 extern int vsnprintf(char *, size_t, const char *, va_list);
+static void draw_user_rows(void);
+// Userspace trace state (see the hooks at the end of this file).
+enum { NAME_BYTES = 24, EXIT_BYTES = 96 };
+// user_phase: a process stage or exit was reported, so BSD processes and the scheduler are up.
+static int user_phase;
+static uint64_t exec_count, exit_count, abnormal_count, irq_el0, irq_total, user_aborts, user_breaks;
+static uint64_t last_el0_pc;
+static char last_exec[NAME_BYTES], exit_lines[EXIT_ROWS][EXIT_BYTES];
+static uint32_t exit_colors[EXIT_ROWS];
+static unsigned exit_next;
+static void panic_user_summary(void);
+// Pinned-row cell cache, see line_at.
+enum { COLUMNS = 192 };
+static char shown[LOG_TOP][COLUMNS];
+static unsigned shown_length[LOG_TOP];
+static uint32_t shown_color[LOG_TOP];
+static uint8_t shown_valid[LOG_TOP];
+static void line_at(unsigned y, const char *text, uint32_t color);
+static unsigned append(char *to, unsigned at, unsigned size, const char *from);
+static unsigned append_number(char *to, unsigned at, unsigned size, uint64_t n, unsigned base);
+#ifndef BOOT_PROGRESS_TEST
+// BootProcessProbe.c (vendored from UniXNU-sheng): proc_iterate in its own worker every 2 s, rows of
+// "name pid threads running waiting busy sampled state/priority W<wait event> C<continuation> U<user PC>".
+extern void boot_process_capture(void);
+extern void boot_process_snapshot(void);
+extern char boot_process_rows[10][120];
+extern void boot_process_irq_sample(uint64_t pc, uint64_t psr);
+extern void boot_process_frames_row(char *to, size_t size);
+extern void boot_process_cpu_row(char *to, size_t size);
+static int process_monitor_started;
+static void process_monitor(void *arg, wait_result_t result);
+// The probe's optional sheng UI-trace hooks; the static kernel link cannot leave weak imports
+// undefined, so erhai defines them as no-ops (-1: no wait-chain peer to follow).
+struct task;
+void boot_ui_trace_begin(void) {}
+void boot_ui_trace_task(struct task *task, unsigned slot, int pid, const char *name, unsigned slide)
+{ (void)task; (void)slot; (void)pid; (void)name; (void)slide; }
+void boot_ui_trace_publish(void) {}
+int boot_ui_trace_role_peer(unsigned role) { (void)role; return -1; }
+#endif
 
 static void barrier(void)
 {
@@ -311,6 +357,7 @@ void boot_progress_panic(const char *format, va_list *args, unsigned long caller
         value_raw("FAR_EL1", fault_far); value_raw("SPSR_EL1", fault_psr);
     } else text_raw("No fatal exception recorded before this panic\n");
     text_raw("poll "); hex_raw(poll_count); text_raw(" timer "); hex_raw(armcpu_timer_interrupts); putc_raw('\n');
+    panic_user_summary();
     text_raw("RECENT STAGES (oldest first)\n");
     unsigned count = stage_count < HISTORY ? stage_count : HISTORY;
     for (unsigned i = stage_count - count; i < stage_count; i++) {
@@ -329,6 +376,7 @@ void early_boot_progress_init(boot_args *args)
     panic_state = 0; stage_count = 0; root_sequence = 0; fault_valid = 0;
     boot_progress_panic_text[0] = 0;
     framebuffer = 0; column = 0; row = LOG_TOP; busy = 0;
+    for (unsigned i = 0; i < LOG_TOP; i++) shown_valid[i] = 0;
     framebuffer_pa = 0;
     if (!geometry(args->Video.v_baseAddr, args->Video.v_width, args->Video.v_height,
                   args->Video.v_rowBytes, args->Video.v_depth)) return;
@@ -434,16 +482,36 @@ static void poll(void *unused0, void *unused1)
 {
     (void)unused0; (void)unused1;
     if (panic_state) return;
+#ifndef BOOT_PROGRESS_TEST
+    // Started here, in the poll thread call, rather than in the exec/exit hooks, which may run with
+    // process locks held. The worker may block in proc_iterate, so it never runs on this thread.
+    if (user_phase && !process_monitor_started) {
+        thread_t thread = THREAD_NULL;
+        process_monitor_started = 1;
+        if (kernel_thread_start_priority(process_monitor, NULL, MAXPRI_KERNEL, &thread) == KERN_SUCCESS)
+            thread_deallocate(thread);
+        else process_monitor_started = 0;
+    }
+    if (process_monitor_started) boot_process_snapshot();
+#endif
     uint64_t flags = irq_save();
     if (framebuffer && !busy) {
         busy = 1;
         unsigned saved_row = row, saved_column = column;
-        row = 1; column = 0; clear_line(LINE);
-        text_raw("poll "); hex_raw(++poll_count); text_raw(" timer "); hex_raw(armcpu_timer_interrupts);
-        row = 2; column = 0; clear_line(2 * LINE);
-        text_raw("DT/CPU/GIC "); putc_raw('0' + !!armdt_platform_configured);
-        putc_raw('/'); putc_raw('0' + !!armcpu_registered); putc_raw('/'); putc_raw('0' + !!armcpu_gic_ready);
-        text_raw(" PPI-enable "); hex_raw(armcpu_gic_boot[1]);
+        char text[96];
+        unsigned n = append(text, 0, sizeof(text), "poll ");
+        n = append_number(text, n, sizeof(text), ++poll_count, 16);
+        n = append(text, n, sizeof(text), " timer ");
+        n = append_number(text, n, sizeof(text), armcpu_timer_interrupts, 16);
+        line_at(1, text, 0xffffffff);
+        n = append(text, 0, sizeof(text), "DT/CPU/GIC ");
+        text[n++] = (char)('0' + !!armdt_platform_configured); text[n++] = '/';
+        text[n++] = (char)('0' + !!armcpu_registered); text[n++] = '/';
+        text[n++] = (char)('0' + !!armcpu_gic_ready); text[n] = 0;
+        n = append(text, n, sizeof(text), " PPI-enable ");
+        n = append_number(text, n, sizeof(text), armcpu_gic_boot[1], 16);
+        line_at(2, text, 0xffffffff);
+        if (user_phase) draw_user_rows();
         row = saved_row; column = saved_column; barrier(); busy = 0;
     }
     irq_restore(flags);
@@ -460,11 +528,193 @@ void boot_progress_start(void)
     thread_call_enter(poll_call);
 }
 
-// Existing later-stage hooks stay observational; this profile has no userspace yet.
-void boot_progress_irq(uint64_t pc, uint64_t psr, uint64_t sp) { (void)pc; (void)psr; (void)sp; }
+// Userspace trace (erhai, 2026-10-23): the root mounts and launchd's signature is accepted, after which
+// the screen used to stay silent. Every exec stage now carries pid and name, every exit is logged
+// (red when it was signalled or carries an exit reason) and the last four stay pinned on rows 5-8;
+// row 4 counts execs, exits and timer interrupts that landed in EL0, with the last EL0 PC, so a
+// spinning process can be told from a blocked one. No Data volume is needed.
+
+static unsigned append(char *to, unsigned at, unsigned size, const char *from)
+{
+    for (unsigned i = 0; from && from[i] && at + 1 < size; i++) to[at++] = from[i] >= 32 && from[i] <= 126 ? from[i] : '?';
+    to[at < size ? at : size - 1] = 0;
+    return at;
+}
+
+static unsigned append_number(char *to, unsigned at, unsigned size, uint64_t n, unsigned base)
+{
+    char digits[24];
+    unsigned count = 0;
+    do { unsigned d = (unsigned)(n % base); digits[count++] = (char)(d < 10 ? '0' + d : 'a' + d - 10); n /= base; } while (n && count < sizeof(digits));
+    while (count && at + 1 < size) to[at++] = digits[--count];
+    to[at < size ? at : size - 1] = 0;
+    return at;
+}
+
+// Pinned rows are redrawn cell by cell, only where the character or the row colour changed. Clearing
+// and redrawing whole 3392-pixel rows took about 3 s per poll with interrupts off on erhai; at
+// priority 81 that kept launchd from ever running on the single CPU.
+
+static void line_at(unsigned y, const char *text, uint32_t color)
+{
+    if (!framebuffer || y >= LOG_TOP) return;
+    if (!shown_valid[y]) {
+        clear_line(y * LINE);
+        shown_valid[y] = 1; shown_length[y] = 0; shown_color[y] = color;
+    }
+    int recolor = shown_color[y] != color;
+    unsigned limit = width / CELL < COLUMNS ? width / CELL : COLUMNS, length = 0;
+    while (length < limit && text[length]) length++;
+    unsigned end = length > shown_length[y] ? length : shown_length[y];
+    for (unsigned x = 0; x < end; x++) {
+        char c = x < length ? text[x] : ' ';
+        if (x < shown_length[y] && shown[y][x] == c && !recolor) continue;
+        glyph((unsigned char)c, x * CELL, y * LINE, color);
+        shown[y][x] = c;
+    }
+    shown_length[y] = length; shown_color[y] = color;
+}
+
+#ifndef BOOT_PROGRESS_TEST
+static void process_monitor(void *arg, wait_result_t result)
+{
+    (void)arg; (void)result;
+    for (;;) {
+        boot_process_capture();
+        delay_for_interval(2000, 1000 * 1000);
+    }
+}
+#endif
+
+static void draw_user_rows(void)
+{
+    char text[160];
+    unsigned n = append(text, 0, sizeof(text), "USER execs ");
+    n = append_number(text, n, sizeof(text), exec_count, 10);
+    n = append(text, n, sizeof(text), " exits ");
+    n = append_number(text, n, sizeof(text), exit_count, 10);
+    n = append(text, n, sizeof(text), " bad ");
+    n = append_number(text, n, sizeof(text), abnormal_count, 10);
+    n = append(text, n, sizeof(text), " irq el0/all ");
+    n = append_number(text, n, sizeof(text), irq_el0, 10);
+    n = append(text, n, sizeof(text), "/");
+    n = append_number(text, n, sizeof(text), irq_total, 10);
+    n = append(text, n, sizeof(text), " el0 aborts ");
+    n = append_number(text, n, sizeof(text), user_aborts, 10);
+    n = append(text, n, sizeof(text), " pc ");
+    n = append_number(text, n, sizeof(text), last_el0_pc, 16);
+    n = append(text, n, sizeof(text), " last ");
+    append(text, n, sizeof(text), last_exec[0] ? last_exec : "-");
+    line_at(USER_ROW, text, 0xff80ffff);
+    for (unsigned i = 0; i < EXIT_ROWS; i++) {
+        unsigned slot = (exit_next + i) % EXIT_ROWS;
+        line_at(USER_ROW + 1 + i, exit_lines[slot][0] ? exit_lines[slot] : "", exit_colors[slot]);
+    }
+#ifndef BOOT_PROGRESS_TEST
+    if (process_monitor_started)
+        for (unsigned i = 0; i < PROCESS_ROWS; i++) {
+            char row_text[120];
+            copy_line(row_text, sizeof(row_text), boot_process_rows[i]);
+            line_at(PROCESS_ROW + i, row_text, 0xffffff80);
+        }
+    char cpu_text[160];
+    boot_process_cpu_row(cpu_text, sizeof(cpu_text));
+    line_at(CPU_ROW, cpu_text, 0xffff80ff);
+    boot_process_frames_row(cpu_text, sizeof(cpu_text));
+    line_at(FRAMES_ROW, cpu_text, 0xffff80ff);
+#endif
+}
+
+static void panic_user_summary(void)
+{
+    if (!exec_count && !exit_count) return;
+    text_raw("USERSPACE execs "); hex_raw(exec_count); text_raw(" exits "); hex_raw(exit_count);
+    text_raw(" last exec "); text_raw(last_exec[0] ? last_exec : "-"); putc_raw('\n');
+    for (unsigned i = 0; i < EXIT_ROWS; i++) {
+        unsigned slot = (exit_next + i) % EXIT_ROWS;
+        if (exit_lines[slot][0]) { text_raw(exit_lines[slot]); putc_raw('\n'); }
+    }
+}
+
+void boot_progress_irq(uint64_t pc, uint64_t psr, uint64_t sp)
+{
+    (void)sp;
+    irq_total++;
+    if ((psr & 0xf) == 0) { irq_el0++; last_el0_pc = pc; }
+#ifndef BOOT_PROGRESS_TEST
+    if (user_phase) boot_process_irq_sample(pc, psr); // threads and processors exist by now
+#endif
+}
+
 void boot_progress_poll(void) {}
-void boot_progress_user_breakpoint(void *state, unsigned esr) { (void)state; (void)esr; }
-void boot_progress_user_abort(void *state, unsigned esr, uint64_t far) { (void)state; (void)esr; (void)far; }
-void boot_progress_critical_exit(int pid, char *s, unsigned long n) { (void)pid; (void)s; (void)n; }
-void boot_progress_process_stage(int pid, const char *name, const char *stage) { (void)pid; (void)name; boot_progress_stage(stage); }
-void boot_progress_exit(int pid, const char *name, int status, unsigned ns, uint64_t code) { (void)pid; (void)name; (void)status; (void)ns; (void)code; }
+void boot_progress_user_breakpoint(void *state, unsigned esr) { (void)state; (void)esr; user_breaks++; }
+void boot_progress_user_abort(void *state, unsigned esr, uint64_t far) { (void)state; (void)esr; (void)far; user_aborts++; }
+
+void boot_progress_critical_exit(int pid, char *s, unsigned long n)
+{
+    // Called for launchd's exit just before the kernel panics on it: keep the reason on screen.
+    char text[160];
+    unsigned at = append(text, 0, sizeof(text), "CRITICAL EXIT p");
+    at = append_number(text, at, sizeof(text), (uint64_t)(unsigned)pid, 10);
+    at = append(text, at, sizeof(text), " ");
+    if (s && n) {
+        char reason[96];
+        unsigned i = 0;
+        for (; i + 1 < sizeof(reason) && i < n && s[i]; i++) reason[i] = s[i];
+        reason[i] = 0;
+        append(text, at, sizeof(text), reason);
+    }
+    boot_progress_stage(text);
+}
+
+void boot_progress_process_stage(int pid, const char *name, const char *stage)
+{
+    char text[STAGE_BYTES + NAME_BYTES + 16];
+    user_phase = 1;
+    unsigned n = append(text, 0, sizeof(text), "p");
+    n = append_number(text, n, sizeof(text), (uint64_t)(unsigned)pid, 10);
+    n = append(text, n, sizeof(text), " ");
+    n = append(text, n, sizeof(text), name ? name : "?");
+    n = append(text, n, sizeof(text), ": ");
+    append(text, n, sizeof(text), stage);
+    if (stage && name) {
+        const char *accepted = "exec process signature accepted";
+        unsigned i = 0;
+        while (accepted[i] && stage[i] == accepted[i]) i++;
+        if (!accepted[i]) { exec_count++; copy_line(last_exec, sizeof(last_exec), name); }
+    }
+    boot_progress_stage(text);
+}
+
+void boot_progress_exit(int pid, const char *name, int status, unsigned ns, uint64_t code)
+{
+    unsigned signal = (unsigned)status & 0x7f;
+    int bad = signal != 0 || ns != 0;
+    uint64_t flags = irq_save();
+    if (!busy && !panic_state) {
+        busy = 1;
+        user_phase = 1;
+        exit_count++;
+        abnormal_count += bad;
+        char *text = exit_lines[exit_next];
+        unsigned n = append(text, 0, EXIT_BYTES, "EXIT p");
+        n = append_number(text, n, EXIT_BYTES, (uint64_t)(unsigned)pid, 10);
+        n = append(text, n, EXIT_BYTES, " ");
+        n = append(text, n, EXIT_BYTES, name ? name : "?");
+        n = append(text, n, EXIT_BYTES, signal ? " sig " : " code ");
+        n = append_number(text, n, EXIT_BYTES, signal ? signal : ((unsigned)status >> 8) & 0xff, 10);
+        if (ns) {
+            n = append(text, n, EXIT_BYTES, " ns ");
+            n = append_number(text, n, EXIT_BYTES, ns, 10);
+            n = append(text, n, EXIT_BYTES, " reason ");
+            append_number(text, n, EXIT_BYTES, code, 16);
+        }
+        exit_colors[exit_next] = bad ? 0xffff6060 : 0xffc0c0c0;
+        exit_next = (exit_next + 1) % EXIT_ROWS;
+        if (column) putc_raw('\n');
+        text_raw("[XNU] "); text_raw(text); putc_raw('\n');
+        draw_user_rows();
+        barrier(); busy = 0;
+    }
+    irq_restore(flags);
+}

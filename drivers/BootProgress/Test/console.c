@@ -39,7 +39,7 @@ static void panic_for_test(const char *format, ...)
 
 int main(void)
 {
-    enum { W = 126, H = 420, PITCH = 132, GUARD = 32 };
+    enum { W = 126, H = 700, PITCH = 132, GUARD = 32 };
     uint32_t *allocation = malloc((PITCH * H + 2 * GUARD) * sizeof(uint32_t));
     assert(allocation);
     for (unsigned i = 0; i < PITCH * H + 2 * GUARD; i++) allocation[i] = 0x12345678;
@@ -49,6 +49,16 @@ int main(void)
     assert(boot_progress_active());
     for (unsigned i = 0; i < 5000; i++) boot_progress_putc((i % 41) ? 'X' : '\n');
     boot_progress_stage("wrap, CR\rLF\n and invalid bytes \1\377");
+    // Userspace trace: pinned exit rows wrap, signalled exits count as bad, long names are clipped.
+    boot_progress_process_stage(1, "launchd", "exec process signature accepted");
+    boot_progress_process_stage(1, "launchd", "exec load_machfile enter");
+    for (int i = 0; i < 6; i++)
+        boot_progress_exit(100 + i, "a-process-name-longer-than-the-row-allows-for-sure", i == 3 ? 6 : 0x100, i == 4 ? 7 : 0, 0x1234);
+    boot_progress_irq(0x1000, 0, 0);
+    boot_progress_irq(0x2000, 5, 0);
+    assert(exec_count == 1 && exit_count == 6 && abnormal_count == 2 && irq_el0 == 1 && last_el0_pc == 0x1000);
+    assert(!strcmp(last_exec, "launchd") && exit_next == 2);
+    boot_progress_critical_exit(1, "launchd reason text that is not NUL terminated", 20);
     for (unsigned i = 0; i < GUARD; i++) {
         assert(allocation[i] == 0x12345678);
         assert(allocation[GUARD + PITCH * H + i] == 0x12345678);

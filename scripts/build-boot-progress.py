@@ -47,9 +47,30 @@ def main():
     assembly = subprocess.check_output(['llvm-objdump', '-d', '--no-show-raw-insn', '--no-leading-addr', obj], text=True)
     if re.search(r'\b(?:[qds][0-9]+|v[0-9]+\.[0-9a-z]+)\b', assembly):
         raise SystemExit('Early/IRQ console unexpectedly uses FP/SIMD registers')
+    # erhai: the process probe (vendored from UniXNU-sheng package/) runs only in its own kernel worker,
+    # never on the early or interrupt path, so it is built with the plain kernel flags and is exempt
+    # from the helper/FP checks above (sheng builds it the same way in build-native-legacy-display.py).
+    probe = output / 'BootProcessProbe.o'
+    probe_command = []
+    values = iter(record['arguments'])
+    for value in values:
+        if value == record['file']:
+            probe_command.append(str(source / 'BootProcessProbe.c'))
+        elif value in ('-o', '-MF', '-MT', '-MJ'):
+            following = next(values)
+            if value == '-o':
+                probe_command += ['-o', str(probe)]
+        elif value == '-Xclang':
+            following = next(values)
+            if not following.startswith('-W'):
+                probe_command += [value, following]
+        elif not value.startswith('-W'):
+            probe_command.append(value)
+    probe_command += ['-Wall', '-Wextra', '-Werror', '-mgeneral-regs-only', '-I', str(root / '.cache/xnu-work/osfmk')]
+    subprocess.run(probe_command, cwd=record['directory'], check=True)
     archive = output / 'libBootProgress.a'
     archive.unlink(missing_ok=True)
-    subprocess.run(['xcrun', 'ar', 'rcs', archive, obj, entry], check=True)
+    subprocess.run(['xcrun', 'ar', 'rcs', archive, obj, entry, probe], check=True)
     print(archive)
 
 
