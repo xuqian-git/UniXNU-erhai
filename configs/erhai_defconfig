@@ -1,4 +1,4 @@
-# Source XNU for early platform bring-up; no Apple kernelcache or root disk.
+# Source XNU for early platform bring-up, with Apple kexts prelinked (board.toml).
 CONFIG_XNU_BUILD_ARCHIVES=y
 CONFIG_XNU_SOURCE_CORECRYPTO14=y
 CONFIG_XNU_SOURCE_PTHREAD=y
@@ -7,7 +7,10 @@ CONFIG_XNU_ARMCPU=y
 CONFIG_XNU_NATIVE_ARCH_TIMER=y
 # The BCM2837 panic buffer address is not mapped on this device.
 CONFIG_XNU_DT_PANIC_REGION=y
-CONFIG_XNU_CRYPTO_BOOTSTRAP="source"
+# The prelink carries com.apple.kec.corecrypto, whose start registers the
+# kernel PRNG. "source" also registers it from the source provider, and the
+# second registration trips assert(!prng_ready) at early_boot (run-3).
+CONFIG_XNU_CRYPTO_BOOTSTRAP="prelinked"
 # CONFIG_XNU_ARMVIRT_PLATFORM is not set
 # CONFIG_XNU_NATIVE_UFS is not set
 # CONFIG_XNU_NATIVE_AES is not set
