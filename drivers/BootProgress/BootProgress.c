@@ -95,6 +95,11 @@ static void barrier(void)
 #endif
 }
 
+// NOTE: ';' starts a comment in the Darwin arm64 assembler, so the "msr daifset" below is never
+// assembled and this only reads DAIF: the writers are preemptible and `busy` only keeps them from
+// overlapping on this single CPU. Masking for real would hold interrupts across whole-row redraws of
+// this slow framebuffer (hundreds of ms), so it is left as it has run; the display handover below
+// therefore never waits for `busy`.
 static uint64_t irq_save(void)
 {
     uint64_t flags = 0;
@@ -155,16 +160,19 @@ static int geometry(uintptr_t base, uint64_t w, uint64_t h, uint64_t pitch, uint
 
 static void clear_line(unsigned y)
 {
-    if (!framebuffer || y + LINE > height) return;
+    // One read of `framebuffer`: the display handover may clear it while a preempted writer is here.
+    uintptr_t base = framebuffer;
+    if (!base || y + LINE > height) return;
     for (unsigned dy = 0; dy < LINE; dy++) {
-        volatile uint32_t *pixels = (volatile uint32_t *)framebuffer + (y + dy) * stride;
+        volatile uint32_t *pixels = (volatile uint32_t *)base + (y + dy) * stride;
         for (unsigned x = 0; x < width; x++) pixels[x] = 0xff000000;
     }
 }
 
 static void glyph(unsigned char c, unsigned x, unsigned y, uint32_t color)
 {
-    if (!framebuffer || x + CELL > width || y + LINE > height) return;
+    uintptr_t base = framebuffer; // see clear_line
+    if (!base || x + CELL > width || y + LINE > height) return;
     if (c < 32 || c > 126) c = '?';
     uint64_t bits = font[c - 32];
     for (unsigned gy = 0; gy < 12; gy++) {
@@ -172,7 +180,7 @@ static void glyph(unsigned char c, unsigned x, unsigned y, uint32_t color)
         for (unsigned gx = 0; gx < 6; gx++) {
             uint32_t pixel = gx < 5 && ((scan >> gx) & 1) ? color : 0xff000000;
             for (unsigned dy = 0; dy < SCALE; dy++) {
-                volatile uint32_t *line = (volatile uint32_t *)framebuffer + (y + gy * SCALE + dy) * stride + x + gx * SCALE;
+                volatile uint32_t *line = (volatile uint32_t *)base + (y + gy * SCALE + dy) * stride + x + gx * SCALE;
                 for (unsigned dx = 0; dx < SCALE; dx++) line[dx] = pixel;
             }
         }
@@ -224,6 +232,32 @@ void boot_progress_bind(uintptr_t base, unsigned w, unsigned h, unsigned pitch, 
 }
 
 int boot_progress_active(void) { return framebuffer != 0; }
+
+// Display handover (NativeLegacyDisplay, kits/erhai/LegacyDisplayProbe.cpp, same interface as sheng's
+// BootProgress): before its first CPU scanout copy the display driver takes the panel, and afterwards
+// nothing but a panic draws again, on the same framebuffer. It does not wait for `busy` (see irq_save):
+// during the launch storm the preemptible log writers held it through all 100 of the driver's retries,
+// the first swap failed and the family's error path panicked in an unimplemented leaf. A writer that
+// was preempted mid-draw finishes at most its current glyph or row, which the next frame overwrites.
+static uintptr_t yielded_framebuffer;
+
+int boot_progress_prepare_scanout(void)
+{
+    if (yielded_framebuffer || !framebuffer) return 1;
+    yielded_framebuffer = framebuffer;
+    framebuffer = 0;
+    barrier();
+    return 1;
+}
+
+void boot_progress_cancel_scanout(void) {}
+
+// sheng keeps a heartbeat pulse in a corner of the system frame; erhai has none.
+int boot_progress_pulse_anchor(uintptr_t base, uint64_t bytes, unsigned w, unsigned h, unsigned pitch)
+{
+    (void)base; (void)bytes; (void)w; (void)h; (void)pitch;
+    return 0;
+}
 
 void boot_progress_putc(char c)
 {
@@ -307,6 +341,7 @@ static void panic_footer(const char *status)
 void boot_progress_panic(const char *format, va_list *args, unsigned long caller,
                          unsigned reason, uint64_t options)
 {
+    if (!framebuffer && yielded_framebuffer) framebuffer = yielded_framebuffer;
     if (!framebuffer) return;
     uint64_t flags = irq_save();
     if (panic_state) {

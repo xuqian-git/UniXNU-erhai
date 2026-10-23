@@ -38,6 +38,9 @@ CONFIG_XNU_NATIVE_PAN=y
 CONFIG_XNU_NATIVE_RAM_BLOCK=y
 CONFIG_XNU_OWNER_DATA_MOUNT=y
 CONFIG_XNU_OWNER_DATA_VOLUME_UUID="5A6AECE7-BEA6-425E-A5EF-6D26CF1B81D4"
+# Display: NativeLegacyDisplay on the UEFI GOP framebuffer, CPU-rendered (no Metal device), as sheng
+# without its Adreno hand-off. Built by scripts/build-native-legacy-display.py (archives in board.toml).
+CONFIG_XNU_NATIVE_LEGACY_DISPLAY=y
 CONFIG_XNU_OWNER_CACHE_MOUNT=y
 CONFIG_XNU_OWNER_CACHE_STARTUP=y
 CONFIG_XNU_OWNER_BOOT_MANIFEST=y

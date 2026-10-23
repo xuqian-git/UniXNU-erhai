@@ -85,6 +85,9 @@ archives = [
   "build-native-virtio-bindings.py --component NativeVirtioBlock",
   # Vendored from UniXNU-sheng (drivers/ShengPlatformPower here).
   "build-sheng-platform-power.py",
+  # NativeLegacyDisplay + NativeGOPPresenter + kits/erhai/LegacyDisplayProbe.cpp; its ABI audit
+  # needs a prelink candidate with IOMobileGraphicsFamily in build/native-prelink.
+  "build-native-legacy-display.py",
 ]
 
 # The prelink is what makes the payload kernel carry Apple's own kexts.
@@ -95,9 +98,9 @@ archives = [
 # SM8750, does). Userspace needs AMFI, so the UFS-root build follows sheng:
 # ShengPlatformPower (sheng-pmgr=2) publishes the original ApplePMGR nub, and
 # AMFI, PMGR and sandbox are back in the set with AMFI's early security init.
-# Still left out (GPU / display / input, not needed to reach launchd):
-#   com.apple.iokit.IOGPUFamily, com.apple.iokit.IOMobileGraphicsFamily,
-#   com.apple.iokit.IOHIDFamily, com.apple.iokit.IOHIDEventDriver
+# SpringBoard needs a display: IOMobileGraphicsFamily (with IOGPUFamily) is the
+# base of NativeLegacyDisplay, IOHIDFamily/IOHIDEventDriver the input stack;
+# the set now equals sheng's.
 [kernel.prelink]
 tool = "kits/NativePrelink/emit_prelink.py"
 kernel = "build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837.unstripped.noctf"
@@ -119,11 +122,15 @@ roots = [
   "com.apple.driver.IODARTFamily",
   "com.apple.filesystems.apfs",
   "com.apple.iokit.CoreAnalyticsFamily",
+  "com.apple.iokit.IOGPUFamily",
   "com.apple.iokit.IOAVFamily",
   "com.apple.iokit.IOAudio2Family",
   "com.apple.iokit.IOCECFamily",
   "com.apple.iokit.IOCryptoAcceleratorFamily",
   "com.apple.iokit.IOHDCPFamily",
+  "com.apple.iokit.IOHIDEventDriver",
+  "com.apple.iokit.IOHIDFamily",
+  "com.apple.iokit.IOMobileGraphicsFamily",
   "com.apple.iokit.IOReportFamily",
   "com.apple.iokit.IOSlowAdaptiveClockingFamily",
   "com.apple.iokit.IOStorageFamily",
@@ -168,9 +175,9 @@ timeout = 10
 # listening to, and the screen simply stops. S1..S6 / boot-progress is the
 # substitute, and it works without any patching.
 panic_screen = false
-# sheng's own list, minus the flags consumed by patches that exist only in that
-# repository (offline-legacy-*, offline-hid-*, offline-mobile-graphics-*).
-# Kept because they are read by code the two boards share: boot-progress=2 turns
+# Started from sheng's own list. The display flags (offline-legacy-*,
+# offline-mobile-graphics-*) are read by upstream patches and drivers and are
+# added at the end; offline-hid-* stays out until input is ported. Kept because they are read by code the two boards share: boot-progress=2 turns
 # on the screen checkpoints build-boot-progress.py compiles in, and
 # armcpu-diagnostics / armcpu-spi-ipi make ArmCpu report the GIC and IPI state.
 #
@@ -250,6 +257,21 @@ kernel_args = [
   "-apfs_shared_datavolume",
   "sheng-disable-watchdogd=1",
   "sheng-lite=1",
+  # Display (CONFIG_XNU_NATIVE_LEGACY_DISPLAY): load IOMobileGraphicsFamily, publish the
+  # GOP framebuffer as /arm-io/gop-display (phase 4) and start NativeLegacyDisplay on it,
+  # with power management, single-layer BGRA swap validation, the CPU copy into the GOP
+  # and per-copy retirement. unit-scale=2: 3392x2400 pixels are 1696x1200 points.
+  # sheng-fb-diff=1 copies only the changed rows of each frame.
+  "offline-mobile-graphics-load=1",
+  "offline-legacy-register=1",
+  "offline-legacy-phase=4",
+  "offline-legacy-gop=1",
+  "offline-legacy-pm=1",
+  "offline-legacy-validate=1",
+  "offline-legacy-transfer=1",
+  "offline-legacy-cpu-present=1",
+  "offline-legacy-unit-scale=2",
+  "sheng-fb-diff=1",
 ]
 
 [payload.adt]
