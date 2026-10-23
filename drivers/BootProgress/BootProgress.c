@@ -240,6 +240,7 @@ int boot_progress_active(void) { return framebuffer != 0; }
 // the first swap failed and the family's error path panicked in an unimplemented leaf. A writer that
 // was preempted mid-draw finishes at most its current glyph or row, which the next frame overwrites.
 static uintptr_t yielded_framebuffer;
+static unsigned overlay_period, overlay_ticks; // see poll
 
 int boot_progress_prepare_scanout(void)
 {
@@ -549,6 +550,18 @@ static void poll(void *unused0, void *unused1)
         if (user_phase) draw_user_rows();
         row = saved_row; column = saved_column; barrier(); busy = 0;
     }
+#ifndef BOOT_PROGRESS_TEST
+    // After the display handover, every erhai-overlay=<seconds> (default 5, 0: off) the userspace rows
+    // are drawn once over the system frame; the display's changed-rows copy (sheng-fb-diff) only
+    // overwrites them where the frame itself changes, so a frozen screen keeps them.
+    else if (yielded_framebuffer && !busy && user_phase && overlay_period && ++overlay_ticks % overlay_period == 0) {
+        busy = 1;
+        framebuffer = yielded_framebuffer;
+        for (unsigned y = USER_ROW; y < LOG_TOP; y++) shown_length[y] = 0;
+        draw_user_rows();
+        framebuffer = 0; barrier(); busy = 0;
+    }
+#endif
     irq_restore(flags);
     uint64_t deadline;
     clock_interval_to_deadline(1, NSEC_PER_SEC, &deadline);
@@ -557,6 +570,9 @@ static void poll(void *unused0, void *unused1)
 
 void boot_progress_start(void)
 {
+#ifndef BOOT_PROGRESS_TEST
+    if (!PE_parse_boot_argn("erhai-overlay", &overlay_period, sizeof(overlay_period))) overlay_period = 5;
+#endif
     poll_call = thread_call_allocate_with_options(poll, NULL, THREAD_CALL_PRIORITY_KERNEL, THREAD_CALL_OPTIONS_ONCE);
     if (!poll_call) { boot_progress_stage("timer observer allocation failed"); return; }
     boot_progress_stage("timer observer scheduled; counters are hexadecimal");

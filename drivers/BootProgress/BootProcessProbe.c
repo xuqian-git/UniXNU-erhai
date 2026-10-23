@@ -10,6 +10,9 @@
 #include <string.h>
 #include <pexpert/pexpert.h>
 #include <kern/misc_protos.h>
+#include <ipc/ipc_space.h>
+#include <ipc/ipc_port.h>
+extern void proc_name(int pid,char *buf,int size); // bsd/sys/proc.h clashes with the Mach types here
 // Exact private process ABI from this source revision's proc.h/proc_internal.h.
 // Do not mix BSD and Mach-private header type universes in one translation unit.
 struct proc;typedef struct proc *proc_t;
@@ -67,6 +70,7 @@ static int capture(proc_t p,void *arg) {
  }
  unsigned count=0,running=0,waiting=0,busy=0,state=0,sampled=0;int priority=0;
  uint64_t wait=0,continuation=0,userPC=0;unsigned onRunq=0,bound=0,mode=0;
+ uint64_t trap=0,remote=0,msgid=0;
  thread_t thread;
  queue_iterate(&task->threads,thread,thread_t,task_threads){
   if(count++>=128)break;
@@ -80,14 +84,33 @@ static int capture(proc_t p,void *arg) {
    sampled=1;state=flags;priority=thread->sched_pri;wait=thread->wait_event;
    continuation=(uint64_t)thread->continuation;
    if(thread->machine.upcb)userPC=(uint64_t)get_saved_state_pc(thread->machine.upcb);
+   // erhai: in the mach_msg2 trap (x16 = -47) x3 holds the destination port name and x4's high word the msgid (as sheng's BootUiTraceProbe).
+   if(thread->machine.upcb && is_saved_state64(thread->machine.upcb)) {
+    trap=(uint64_t)get_saved_state_reg(thread->machine.upcb,16);
+    remote=(uint32_t)get_saved_state_reg(thread->machine.upcb,3);msgid=(uint64_t)get_saved_state_reg(thread->machine.upcb,4)>>32;
+   }
    // erhai: is the runnable thread actually on a run queue, and is it bound to a processor?
    onRunq=thread->__runq.runq!=PROCESSOR_NULL;bound=thread->bound_processor!=PROCESSOR_NULL;mode=(unsigned)thread->sched_mode;
   }
   thread_unlock(thread);ml_set_interrupts_enabled(irq);
  }
- unsigned total=(unsigned)task->thread_count,slide=task->task_shared_region_slide;task_unlock(task);
- snprintf(capture_rows[index],120,"%.15s p%d n%u r%u w%u b%u t%u s%x/%d W%llx C%llx U%llx +%x q%u B%u m%u",
-  name,proc_pid(p),total,running,waiting,busy,sampled,state,priority,wait,continuation,userPC,slide,onRunq,bound,mode);
+ unsigned total=(unsigned)task->thread_count,slide=task->task_shared_region_slide;
+ ipc_space_t space=task->itk_space;if(space)is_reference(space);
+ task_unlock(task);
+ // The process the first thread waits on: the receiver of the port it sent to (outside the task and scheduler locks).
+ int peer=-1;char peerName[20]="";
+ if(space && trap==UINT64_MAX-46 && remote) {
+  ipc_port_t port=IP_NULL;
+  if(ipc_port_translate_send(space,(mach_port_name_t)remote,&port)==KERN_SUCCESS){peer=ipc_port_get_receiver_task_locked(port,NULL);ip_mq_unlock(port);}
+  if(peer>=0)proc_name(peer,peerName,sizeof(peerName));
+ }
+ if(space)is_release(space);
+ if(trap==UINT64_MAX-46)
+  snprintf(capture_rows[index],120,"%.15s p%d n%u r%u w%u s%x/%d U%llx msg2 port %llx id %llx -> p%d %s",
+   name,proc_pid(p),total,running,waiting,state,priority,userPC,remote,msgid,peer,peerName);
+ else
+  snprintf(capture_rows[index],120,"%.15s p%d n%u r%u w%u b%u t%u s%x/%d W%llx C%llx U%llx +%x q%u B%u m%u trap %lld",
+   name,proc_pid(p),total,running,waiting,busy,sampled,state,priority,wait,continuation,userPC,slide,onRunq,bound,mode,(long long)trap);
  if(trace_slot[index] && boot_ui_trace_task)boot_ui_trace_task(task,index,proc_pid(p),name,slide);
  capture_seen=capture_seen+1;return PROC_RETURNED;
 }
